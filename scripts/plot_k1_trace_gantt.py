@@ -84,13 +84,13 @@ def model_of(job_name: str, row: dict | None = None) -> str:
 K1_RDTIME_HZ = k1_trace.K1_RDTIME_HZ
 
 
-def read_trace(path: str) -> List[dict]:
+def read_trace(path: str, rdtime_hz: float = K1_RDTIME_HZ) -> List[dict]:
     """Both producers' schemas, normalised in `xpu-rt/k1_trace.py`.
 
     The reader lives in the shared module rather than here, so every tool that
     reads a ModelBlaster trace (e.g. `join_k1_trace.py`) uses the same one.
     """
-    return k1_trace.read(path)
+    return k1_trace.read(path, rdtime_hz=rdtime_hz)
 
 
 def read_schedule(path: Optional[str]) -> Dict[str, dict]:
@@ -197,13 +197,14 @@ def draw(ax, rows: Sequence[dict], sched: Dict[str, dict],
 
 
 def render(panels: List[Tuple[str, str, Optional[str]]], out: str,
-           window_ms: float, height_per_panel_mm: float = 26.0) -> None:
+           window_ms: float, height_per_panel_mm: float = 26.0,
+           rdtime_hz: float = K1_RDTIME_HZ, board_label: str = "K1") -> None:
     """panels: list of (title, trace_path, schedule_path)."""
     loaded = []
     all_lanes: List[str] = []
     models: List[str] = []
     for title, tp, sp in panels:
-        rows = read_trace(tp)
+        rows = read_trace(tp, rdtime_hz)
         sched = read_schedule(sp)
         loaded.append((title, rows, sched, periods_from_schedule(sp)))
         for r in rows:
@@ -242,7 +243,7 @@ def render(panels: List[Tuple[str, str, Optional[str]]], out: str,
         ax.set_title(title, loc="left", pad=2)
         ax.text(-0.062, 1.16, lab, transform=ax.transAxes, fontsize=8,
                 fontweight="bold", va="top", ha="right")
-    axes[-1].set_xlabel("Time on the K1 (ms)")
+    axes[-1].set_xlabel(f"Time on the {board_label} (ms)")
 
     handles = [Patch(facecolor=colours[m], label=m) for m in models]
     tight = max((p for _, _, _, pr in loaded for p in pr.values()), default=None)
@@ -270,6 +271,10 @@ def main() -> int:
                     help="LABEL=trace.csv:schedule.json, repeatable")
     ap.add_argument("--out", required=True)
     ap.add_argument("--window-ms", type=float, default=140.0)
+    ap.add_argument("--clock-hz", type=float, default=K1_RDTIME_HZ,
+                    help="rdtime frequency of the trace ticks (default 24e6)")
+    ap.add_argument("--board-label", default="K1",
+                    help="board name in the time-axis label (default K1; pass K3 for K3 traces)")
     a = ap.parse_args()
 
     panels: List[Tuple[str, str, Optional[str]]] = []
@@ -283,7 +288,8 @@ def main() -> int:
     else:
         ap.error("need --trace or --composite")
 
-    render(panels, a.out, a.window_ms)
+    render(panels, a.out, a.window_ms, rdtime_hz=a.clock_hz,
+           board_label=a.board_label)
     return 0
 
 

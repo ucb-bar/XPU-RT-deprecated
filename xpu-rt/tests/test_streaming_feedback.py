@@ -51,6 +51,10 @@ class TicksAreRdtimeAt24MHz(unittest.TestCase):
         """1.6 GHz or 1 MHz would both produce plausible-looking numbers."""
         self.assertEqual(sf.TICKS_PER_US, 24.0)
 
+    def test_the_clock_is_a_parameter(self):
+        ev = sf.normalise_event(_line(t0=0, t1=24_000), rdtime_hz=48e6)
+        self.assertAlmostEqual(ev["run_us"], 500.0)
+
     def test_a_line_that_is_not_a_dispatch_end_is_skipped_not_crashed(self):
         self.assertIsNone(sf.normalise_event({"hello": "world"}))
         self.assertIsNone(sf.normalise_event({"network": "d", "instance": 0}))

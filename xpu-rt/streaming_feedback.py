@@ -69,13 +69,15 @@ _SKIP_RATE_FOR_FINER = 0.05            # > 5% of epochs skipped → finer
 _PIN_TARGET_STICKINESS = 0.95          # if 95% of epochs ran on same target → pin
 
 
-#: Board `rdtime` is a fixed 24.000 MHz (device-tree timebase-frequency).
-#: Not the 1.6 GHz core clock, and not 1 MHz.
-TICKS_PER_US = 24.0
+#: Board `rdtime` is a fixed 24.000 MHz (device-tree timebase-frequency) on both
+#: K1 and K3. Not the core clock, and not 1 MHz. `--clock-hz` overrides it.
+K1_RDTIME_HZ = 24_000_000.0
+TICKS_PER_US = K1_RDTIME_HZ / 1e6
 
 
 def normalise_event(line: dict[str, Any],
-                    windows_ms: Optional[dict[str, float]] = None
+                    windows_ms: Optional[dict[str, float]] = None,
+                    rdtime_hz: float = K1_RDTIME_HZ,
                     ) -> Optional[dict[str, Any]]:
     """One walker telemetry line -> the event the hint derivation consumes.
 
@@ -99,7 +101,8 @@ def normalise_event(line: dict[str, Any],
     except (KeyError, TypeError, ValueError):
         return None
 
-    run_us = max(0.0, (t1 - t0) / TICKS_PER_US)
+    ticks_per_us = rdtime_hz / 1e6
+    run_us = max(0.0, (t1 - t0) / ticks_per_us)
     planned_us = float(line.get("predicted_duration_ms", 0.0)) * 1000.0
 
     miss = None
@@ -107,7 +110,7 @@ def normalise_event(line: dict[str, Any],
         # End of this dispatch against the instance's deadline: instance k of
         # a network with deadline D must be done by (k+1)*D from run start.
         deadline_us = float(windows_ms[net]) * 1000.0 * (inst + 1)
-        miss = (t1 / TICKS_PER_US) > deadline_us
+        miss = (t1 / ticks_per_us) > deadline_us
 
     return {
         "epoch": inst,
@@ -335,6 +338,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "deadlines, and a structural zero that reads as a "
                         "measurement hides real misses (e.g. a "
                         "digit-suffixed network name misparsed).")
+    p.add_argument("--clock-hz", type=float, default=K1_RDTIME_HZ,
+                   help="rdtime frequency in Hz that start/end_ticks count at "
+                        "(default 24e6, the K1 and K3 timebase).")
     p.add_argument("--run-id", required=True,
                    help="Run identifier for this streaming session. "
                         "Reuse across consecutive POSTs to accumulate "
@@ -408,7 +414,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         for raw in _stream_lines(args.telemetry_stream, args.follow,
                                  args.poll_s):
-            ev = normalise_event(raw, windows_ms)
+            ev = normalise_event(raw, windows_ms, args.clock_hz)
             if ev is None:
                 continue          # not a dispatch-end record
             window.append(ev)

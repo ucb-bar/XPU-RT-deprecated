@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(
 import k1_trace  # noqa: E402
 
 
-def load_trace(path, slot_maps=None):
+def load_trace(path, slot_maps=None, rdtime_hz=k1_trace.K1_RDTIME_HZ):
     """`{dispatch_key: [row, ...]}` from either producer's trace.
 
     `k1_trace.normalise` is what makes the ModelBlaster schema readable here at
@@ -44,7 +44,7 @@ def load_trace(path, slot_maps=None):
     distinction a deadline miss turns on.
     """
     rows = defaultdict(list)
-    for r in k1_trace.read(path, slot_maps):
+    for r in k1_trace.read(path, slot_maps, rdtime_hz=rdtime_hz):
         rows[r["dispatch_key"]].append(r)
     return rows
 
@@ -152,13 +152,16 @@ def main() -> int:
     ap.add_argument("--allow-misaligned", action="store_true",
                     help="report per-dispatch errors even when the schedule "
                          "and the trace disagree about what each id names")
+    ap.add_argument("--clock-hz", type=float, default=k1_trace.K1_RDTIME_HZ,
+                    help="rdtime frequency the trace's ticks count at (default 24e6: "
+                         "the K1 and K3 timebase). Every tick->us conversion uses it.")
     a = ap.parse_args()
 
     sched = json.load(open(a.schedule))
     disp = sched["dispatches"]
     periods = (sched.get("metadata") or {}).get("periodic_networks") or {}
     slot_maps = k1_trace.slot_maps_from_irs(a.ir) if a.ir else None
-    trace = load_trace(a.trace, slot_maps)
+    trace = load_trace(a.trace, slot_maps, a.clock_hz)
 
     n_checked, n_bad, per_job = audit_alignment(disp, trace)
     if n_bad:
