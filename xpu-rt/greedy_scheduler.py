@@ -133,6 +133,8 @@ def _duration(op, combo_idx, machine_combinations, machines) -> float:
 # Durations are in ms, so this is a nanosecond-scale guard against a
 # placement being rejected purely by floating-point round-off.
 _EPS = 1e-9
+#: Completion times (ms) closer than this count as a tie for XPURT_TIE_LEAST_LOADED.
+_TIE_EPS = 1e-6
 
 # Default for how much slower than its own fastest combination a periodic op
 # may run in exchange for staying off a lane the non-periodic jobs need
@@ -438,6 +440,28 @@ def _schedule_loop(workload, mode: str,
     combination_available_time = np.zeros(num_combinations)
     scheduled = [False] * num_operations
 
+    # TIE RULE (opt-in, XPURT_TIE_LEAST_LOADED=1; off = unchanged results). Candidates are
+    # compared by completion time with a strict `<`, and combinations are walked in index
+    # order, so equal completion times went to the lowest-numbered combination -- on the K3
+    # the core-0 groups (CPU_P#0, 0+1, 0-3, 0-7). In the 2026-11-03 60 Hz shard run that
+    # made the worker on cpu 0 execute 5,488 of the X100 entries (cpu 4: 219) and spend 89%
+    # of the second in kernels, and overruns there delayed every group containing cpu 0.
+    # With the rule on, an exact tie goes to the combination whose busiest core has the
+    # least work booked so far.
+    tie_least_loaded = os.environ.get("XPURT_TIE_LEAST_LOADED", "0") not in ("0", "", "false")
+    machine_load: dict = {}
+
+    def _combo_load(k):
+        return max(machine_load.get(m, 0.0) for m in machine_combinations[k])
+
+    def _better(c, k, best_c, best_k):
+        if not tie_least_loaded or best_k is None:
+            return c < best_c
+        if c < best_c - _TIE_EPS:
+            return True
+        if c > best_c + _TIE_EPS:
+            return False
+        return _combo_load(k) < _combo_load(best_k)
 
     while not all(scheduled):
         # Best non-periodic candidate (always preferred under greedy_periodic).
@@ -509,7 +533,7 @@ def _schedule_loop(workload, mode: str,
                 # time — same as the original greedy behavior. A
                 # downstream validator surfaces any final miss.
                 if is_periodic:
-                    if completion_time < best_p_completion:
+                    if _better(completion_time, combo_idx, best_p_completion, best_p_combo):
                         best_p_completion = completion_time
                         best_p_op = i
                         best_p_combo = combo_idx
@@ -518,7 +542,7 @@ def _schedule_loop(workload, mode: str,
                                           if op.max_end_t is not None
                                           else float("inf"))
                 else:
-                    if completion_time < best_np_completion:
+                    if _better(completion_time, combo_idx, best_np_completion, best_np_combo):
                         best_np_completion = completion_time
                         best_np_op = i
                         best_np_combo = combo_idx
@@ -602,6 +626,8 @@ def _schedule_loop(workload, mode: str,
             chosen_combo, machine_combinations, machines
         )
         op_end = chosen_start + duration
+        for m in machine_combinations[chosen_combo]:
+            machine_load[m] = machine_load.get(m, 0.0) + duration
 
         combination_available_time[chosen_combo] = op_end
         for combo_idx in range(num_combinations):

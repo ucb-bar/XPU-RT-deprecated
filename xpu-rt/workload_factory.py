@@ -330,6 +330,26 @@ def topo_tag_for_combination(combo: list[str]) -> str:
     return "topo_" + "_".join(str(i) for i in range(n))
 
 
+def topo_tag_for_cores(combo: list[str], core_ids: dict[str, list[int]]) -> str:
+    """Topo tag naming the kind's real cpu ids, for chips whose kinds do not
+    all start at cpu 0 (K3: X100 = cpus 0-7, A100 = cpus 8-15).
+
+    Anchored like `topo_tag_for_combination`: a group of n cores of one kind
+    reads the measurement taken on that kind's first n cpus, so
+    ['CPU_E#2', 'CPU_E#3'] with core_ids {'CPU_E': [8, ..., 15]} -> 'topo_8_9'.
+    Only the size of the group matters; which cores of the kind it holds does not.
+    """
+    kind = machine_type_prefix(combo[0])
+    if any(machine_type_prefix(m) != kind for m in combo):
+        raise ValueError(f"combination mixes machine kinds: {combo}")
+    ids = core_ids.get(kind)
+    if ids is None:
+        raise KeyError(f"no core_ids for machine kind {kind!r} (have {sorted(core_ids)})")
+    if len(combo) > len(ids):
+        raise ValueError(f"{combo}: {len(combo)} cores but {kind} lists only {len(ids)} cpu ids")
+    return "topo_" + "_".join(str(i) for i in ids[:len(combo)])
+
+
 def resolve_dispatch_deps_path(repo_base_path: str, dispatch_deps_path: str) -> str:
     """
     Resolve a dispatch dependency JSON path across current and legacy layouts.

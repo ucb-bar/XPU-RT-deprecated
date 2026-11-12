@@ -75,6 +75,83 @@ def _portable_repo_paths(paths: list[str]) -> list[str]:
     return portable
 
 
+def _parse_profile_kinds(profile_cfg: dict, machine_core_counts: dict) -> dict:
+    """Read the optional per-kind `hardware.profile` fields.
+
+      "targets":  {"cpu_p": "spacemit_x100", "cpu_e": "spacemit_a100"}
+      "impls":    {"cpu_p": {"rvv": "rvv_x60", "ime": "ime_x60"},
+                   "cpu_e": {"rvv": "rvv_x60", "ime2": "ime2_a100"}}
+      "core_ids": {"cpu_p": [0, 1, 2, 3], "cpu_e": [8, 9, 10, 11]}
+
+    `impls` maps each implementation a kind may run to the profile folder it
+    was measured under, and is also that kind's capability set: an impl not
+    listed for a kind is never offered there. `targets` says which profile
+    target each kind's measurements live under. `core_ids` gives each kind's
+    real cpu ids, so a group is tagged topo_8_9 rather than topo_0_1.
+    All three are needed together; none of them is the K1 behaviour.
+    """
+    keys = ("targets", "impls", "core_ids")
+    given = [k for k in keys if profile_cfg.get(k) is not None]
+    if not given:
+        return {"profile_targets": None, "profile_impls": None, "profile_core_ids": None}
+    if len(given) != len(keys):
+        raise ValueError(f"hardware.profile: {sorted(set(keys) - set(given))} missing; "
+                         f"'targets', 'impls' and 'core_ids' are used together")
+    # A topo override would replace the per-kind tags wholesale (both kinds
+    # reading topo_0), and topo_tag_per_hw is keyed by plain hw names that
+    # never match a 'folder@target' label, so either one would be silently
+    # wrong here.
+    if profile_cfg.get("topo_tag_override") or profile_cfg.get("topo_tag_per_hw"):
+        raise ValueError("hardware.profile: topo_tag_override / topo_tag_per_hw cannot be "
+                         "combined with core_ids, which sets each kind's topo tags")
+    kinds = set(machine_core_counts)
+    out = {}
+    for k in keys:
+        raw = profile_cfg[k]
+        if not isinstance(raw, dict):
+            raise ValueError(f"hardware.profile.{k}: want {{kind: ...}}, got {raw!r}")
+        per_kind = {str(kind).strip().upper(): v for kind, v in raw.items()}
+        missing = kinds - set(per_kind)
+        unknown = set(per_kind) - kinds - {CPU_P, CPU_E}   # a 0-count kind may stay listed
+        if missing or unknown:
+            raise ValueError(f"hardware.profile.{k}: kinds {sorted(per_kind)} vs "
+                             f"hardware.machines {sorted(kinds)} (missing {sorted(missing)}, "
+                             f"unknown {sorted(unknown)})")
+        out[f"profile_{k}"] = {kind: per_kind[kind] for kind in kinds}
+
+    def _name_ok(v) -> bool:   # used as a path component and split on '@'
+        return isinstance(v, str) and bool(v) and not any(c in v for c in "@/")
+
+    for kind in sorted(kinds):
+        where = f"hardware.profile.{{}}.{kind.lower()}"
+        target = out["profile_targets"][kind]
+        if not _name_ok(target):
+            raise ValueError(f"{where.format('targets')}: want a target name, got {target!r}")
+        impls = out["profile_impls"][kind]
+        if not isinstance(impls, dict) or not impls or \
+                not all(_name_ok(i) and _name_ok(f) for i, f in impls.items()):
+            raise ValueError(f"{where.format('impls')}: want {{impl: profile folder}}, got {impls!r}")
+        for impl, folder in impls.items():
+            # The loader recognises a matrix-engine profile by its folder name
+            # (an 'ime*' folder is optional per network, and its rvv rows are
+            # not matrix kernels), so the folder must say what the impl is.
+            if impl.startswith("ime") != folder.lower().startswith("ime"):
+                raise ValueError(f"{where.format('impls')}: impl {impl!r} -> folder {folder!r}; "
+                                 f"an ime* impl needs an ime* folder and vice versa")
+        ids = out["profile_core_ids"][kind]
+        if not isinstance(ids, list) or not all(
+                type(i) is int and i >= 0 for i in ids) or len(set(ids)) != len(ids):
+            raise ValueError(f"{where.format('core_ids')}: want distinct cpu ids, got {ids!r}")
+        if len(ids) < machine_core_counts[kind]:
+            raise ValueError(f"{where.format('core_ids')}: {len(ids)} ids for "
+                             f"{machine_core_counts[kind]} machines")
+    all_ids = [i for kind in kinds for i in out["profile_core_ids"][kind]]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError(f"hardware.profile.core_ids: a cpu id is listed under two kinds: "
+                         f"{out['profile_core_ids']}")
+    return out
+
+
 def load_networks_config(json_path: str) -> tuple[dict, dict]:
     """
     Load a network dependencies JSON file and extract hardware/scheduler config.
@@ -138,6 +215,11 @@ def load_networks_config(json_path: str) -> tuple[dict, dict]:
         # need to read different topos to reflect the actual cluster
         # widths. Takes precedence over the scalar topo_tag_override.
         "profile_topo_tag_per_hw": profile_cfg.get("topo_tag_per_hw") or None,
+        # Optional per-kind profile settings, for chips whose machine kinds
+        # were profiled as different targets (K3: X100 and A100). Absent on
+        # every K1 config, which then behaves exactly as before. See
+        # _parse_profile_kinds.
+        **_parse_profile_kinds(profile_cfg, machine_core_counts),
         "gen_root": profile_cfg.get("gen_root", None),
         "p_core_speedup": float(hw.get("p_core_speedup", 1.5)),
         "random_seed": seed,
@@ -288,6 +370,10 @@ def schedule_iree_networks(
     profile_topo_tag = cfg["profile_topo_tag"]
     profile_topo_tag_override = cfg["profile_topo_tag_override"]
     profile_topo_tag_per_hw = cfg["profile_topo_tag_per_hw"]
+    # Per-kind profile settings (K3); all None on K1 configs.
+    profile_targets = cfg.get("profile_targets")
+    profile_impls = cfg.get("profile_impls")
+    profile_core_ids = cfg.get("profile_core_ids")
     # `gen_root` selects which profile tree the timings come from, and is read
     # here so a config naming an alternate tree gets that tree -- otherwise a run
     # could be labelled with one timing basis while using another. Defaulting to "gen" preserves
@@ -337,6 +423,9 @@ def schedule_iree_networks(
     print(f"  Machine core counts: {machine_core_counts}")
     print(f"  Profile HW mapping: {CPU_P}->{cpu_p_profile_hw}, {CPU_E}->{cpu_e_profile_hw}")
     print(f"  Profile target/topology: target={profile_target}, topo_tag={profile_topo_tag}")
+    if profile_targets is not None:
+        print(f"  Per-kind profiles: targets={profile_targets} impls={profile_impls} "
+              f"core_ids={profile_core_ids}")
     print(f"  p_core_speedup: {effective_p_core_speedup}")
     print(f"  random_seed: {'nondeterministic' if effective_random_seed is None else effective_random_seed}")
     print(f"  solver_verbosity: {effective_solver_verbosity}")
@@ -393,7 +482,22 @@ def schedule_iree_networks(
     # (INFEASIBLE_COST) and the solver simply never places there — no free NPU.
     combo_impls = None
     enable_impls = bool(networks_data.get("scheduler", {}).get("enable_impls", False))
-    if enable_impls:
+    if profile_impls is not None:
+        # Per-kind implementations (K3). Each kind's impls are its whole
+        # capability set, so ime2 exists only where the config lists it (the
+        # A100s) and ime only on the X100s: their tiles differ, and an X100
+        # ime kernel on an A100 gives wrong answers rather than a trap.
+        if not enable_impls:
+            raise ValueError("hardware.profile.impls needs scheduler.enable_impls: true")
+        from capabilities import build_machine_combinations_with_impls
+        kind_caps = {k: frozenset(v) for k, v in profile_impls.items()}
+        machine_impls = {k: list(profile_impls[k]) for k in machine_core_counts}
+        _gran = "per_core" if machine_combination_mode == "singletons" else machine_combination_mode
+        machines, machine_combinations, combo_impls = build_machine_combinations_with_impls(
+            machine_core_counts, machine_impls, kind_caps, granularity=_gran)
+        _by_impl = {i: combo_impls.count(i) for i in dict.fromkeys(combo_impls)}
+        print(f"  Impl-aware combinations: {len(machine_combinations)} total, by impl {_by_impl}")
+    elif enable_impls:
         from capabilities import build_machine_combinations_with_impls, K1_CAPABILITIES
         # Expose only rvv+ime as placement choices (scalar is a correctness
         # fallback, never a preferred placement); intersect with each kind's caps.
@@ -421,6 +525,12 @@ def schedule_iree_networks(
     combo_hw = []
     for ci, combo in enumerate(machine_combinations):
         core_type = machine_type_prefix(combo[0])
+        if profile_impls is not None:
+            # 'ime2_a100@spacemit_a100': the profile folder this impl was
+            # measured under, at this kind's target (profile_loader.split_hw_label).
+            combo_hw.append(f"{profile_impls[core_type][combo_impls[ci]]}"
+                            f"@{profile_targets[core_type]}")
+            continue
         hw = profile_hw_map.get(core_type.lower())
         if hw is None:
             # Fall back to the legacy two-machine convention.
@@ -449,19 +559,25 @@ def schedule_iree_networks(
             tt_override = profile_topo_tag
         else:
             tt_override = None
+        # The loader buckets a profile as "p" when its hw equals this; with
+        # per-kind labels that is CPU_P's rvv label.
+        loader_p_hw = cpu_p_profile_hw
+        if profile_impls is not None and "rvv" in profile_impls.get(CPU_P, {}):
+            loader_p_hw = f"{profile_impls[CPU_P]['rvv']}@{profile_targets[CPU_P]}"
         processing_times, combined_profiled_p, combined_profiled_e, profiled_by_network = load_profiled_processing_times(
             networks=networks,
             repo_base_path=repo_base_path,
             machine_combinations=machine_combinations,
             combo_hw=combo_hw,
             profile_target=profile_target,
-            cpu_p_profile_hw=cpu_p_profile_hw,
+            cpu_p_profile_hw=loader_p_hw,
             cpu_e_profile_hw=cpu_e_profile_hw,
             rng=rng,
             p_core_speedup=effective_p_core_speedup,
             topo_tag_override=tt_override,
             gen_root=gen_root,
             board_calibration=board_calibration,
+            core_ids=profile_core_ids,
         )
 
     # "Periodic" means the op belongs to a network the workload declared
@@ -1216,6 +1332,9 @@ def schedule_iree_networks(
     # Builds the per-machine-kind label from the generalised profile_hw_map
     # so 3-way (and higher) configs render correctly.
     plot_profile_hw = {k.upper(): v for k, v in profile_hw_map.items()}
+    if profile_targets is not None:
+        for _kind, _target in profile_targets.items():
+            plot_profile_hw.setdefault(_kind, _target)
     plot_profile_hw.setdefault(CPU_P, cpu_p_profile_hw)
     plot_profile_hw.setdefault(CPU_E, cpu_e_profile_hw)
     # The Gantt render must never be able to destroy the run's data: this call
@@ -1276,6 +1395,10 @@ def schedule_iree_networks(
         pdb_hash=_pdb_hash,
         pdb_files=_pdb_files,
         combo_impls=combo_impls,
+        profile_kinds=(None if profile_impls is None else
+                       {"targets": profile_targets, "impls": profile_impls,
+                        "core_ids": profile_core_ids,
+                        "hw_labels": sorted(set(combo_hw))}),
     )
 
     # PER-DISPATCH RUNTIME FEEDBACK. `derive_dispatch_hints` wants the

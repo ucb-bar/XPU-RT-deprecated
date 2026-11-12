@@ -98,6 +98,7 @@ def output_scheduled_json(
     pdb_hash: str | None = None,
     pdb_files: list[str] | None = None,
     combo_impls: list[str] | None = None,
+    profile_kinds: dict | None = None,
 ):
     """
     Output a combined JSON file with all dispatches, their hardware targets, and start times.
@@ -425,6 +426,10 @@ def output_scheduled_json(
             # killed v8 (the fixture was solved against a pre-bit-exact
             # PDB; the runtime ran bit-exact kernels against it).
             **({"pdb_hash": pdb_hash} if pdb_hash else {}),
+            # profile_kinds: per-kind profile targets, impl folders and cpu
+            # ids, when the config set them (K3: X100 and A100 profiled
+            # separately). Says which measurements each kind was costed from.
+            **({"profile_kinds": profile_kinds} if profile_kinds else {}),
             **({"pdb_files": pdb_files} if pdb_files else {}),
             # solve_hash / solve_env: what this solve was solved AGAINST, beyond the
             # profile CSVs -- the calibration table's content hash, the solver and

@@ -22,6 +22,7 @@ from compile_advice import n_cores_from_topo_tag
 from workload_factory import (
     resolve_dispatch_deps_path,
     topo_tag_for_combination,
+    topo_tag_for_cores,
     machine_type_prefix,
 )
 
@@ -245,25 +246,45 @@ def find_profile_csv(
     return max(matches, key=lambda p: os.path.getmtime(p))
 
 
+def split_hw_label(hw: str, default_target: str) -> tuple[str, str]:
+    """'ime2_a100@spacemit_a100' -> ('ime2_a100', 'spacemit_a100').
+
+    A combination's hw label carries its own profile target when the machine
+    kinds were profiled as different targets (K3: X100 and A100 both run
+    rvv_x60, under spacemit_x100 and spacemit_a100). A plain label ('rvv_x60')
+    uses the config's single `profile.target`, as before.
+    """
+    hw_dir, _, target = hw.partition("@")
+    return hw_dir, (target or default_target)
+
+
 def _resolve_topo_for(
-    hw: str, combo: list[str], topo_tag_override
+    hw: str, combo: list[str], topo_tag_override, core_ids=None
 ) -> str:
     """Pick the topo tag to use for a given (hw, combo).
 
     `topo_tag_override` may be:
-      - None: use topo_tag_for_combination(combo)
+      - None: use the combination's default tag
       - str:  apply the same override to every (hw, combo)
-      - dict[str, str]: per-hw override; falls back to combo size if hw
+      - dict[str, str]: per-hw override; falls back to the default tag if hw
         not in the dict.
+    The default tag is topo_tag_for_combination(combo) (cpu ids counted from
+    0 within each kind), or topo_tag_for_cores(combo, core_ids) when the
+    config gives each kind's real cpu ids (`profile.core_ids`).
     """
-    if topo_tag_override is None:
+    def _default() -> str:
+        if core_ids:
+            return topo_tag_for_cores(combo, core_ids)
         return topo_tag_for_combination(combo)
+
+    if topo_tag_override is None:
+        return _default()
     if isinstance(topo_tag_override, str):
         return topo_tag_override
     if isinstance(topo_tag_override, dict):
         if hw in topo_tag_override:
             return topo_tag_override[hw]
-        return topo_tag_for_combination(combo)
+        return _default()
     raise TypeError(
         f"topo_tag_override must be None, str, or dict[str, str]; "
         f"got {type(topo_tag_override).__name__}"
@@ -592,6 +613,30 @@ def _apply_id_remap(prof: dict, remap: dict, widths: dict | None = None,
     return out
 
 
+def _requested_pairs(
+    combo_hw: list[str],
+    machine_combinations: list[list[str]],
+    topo_tag_override=None,
+    core_ids: dict[str, list[int]] | None = None,
+) -> set[tuple[str, str]]:
+    """The (hw, topo) profiles a schedule needs.
+
+    Without `core_ids` this is every hw crossed with every combination's tag
+    (the original behaviour, kept so K1 schedules do not change). With
+    `core_ids` each combination is paired only with its own hw: the kinds'
+    tags differ (topo_0 vs topo_8), so crossing them would ask for X100
+    profiles at A100 cpus.
+    """
+    if core_ids:
+        return {(hw, _resolve_topo_for(hw, combo, topo_tag_override, core_ids))
+                for hw, combo in zip(combo_hw, machine_combinations)}
+    # only meaningful (hw, combo) pairs — combo's hw matters because we look
+    # up profile under that hw. Iterate hw_types to be safe; the resolver
+    # picks the topo.
+    return {(hw, _resolve_topo_for(hw, combo, topo_tag_override))
+            for hw in set(combo_hw) for combo in machine_combinations}
+
+
 def _load_all_topo_profiles(
     net_id: str,
     net_info: dict,
@@ -602,6 +647,7 @@ def _load_all_topo_profiles(
     machine_combinations: list[list[str]],
     topo_tag_override=None,
     gen_root: str = "gen",
+    core_ids: dict[str, list[int]] | None = None,
 ) -> dict[tuple[str, str], dict[int, dict]]:
     """
     Load profiles for all (hw, topo) combinations for a network.
@@ -616,29 +662,32 @@ def _load_all_topo_profiles(
     dict[hw, topo] = per-hw override that lets a "cluster" cpu_e (one
     machine, four physical harts under the hood) read its multi-core
     profile data while a singleton cpu_p still reads topo_0.
+
+    `core_ids`: {kind: [cpu ids]} from `profile.core_ids`; tags name real cpu
+    ids (topo_8 for the first A100). A `combo_hw` entry 'hw@target' reads that
+    target's tree instead of `profile_target` (see split_hw_label).
     """
     basename = workload_spec.basename_from_dispatch_deps_path(dispatch_deps_path) or f"{net_id}.q.int8"
     candidates = workload_spec.model_candidates(net_id, net_info, dispatch_deps_path)
     profiles: dict[tuple[str, str], dict[int, dict]] = {}
 
-    hw_types = set(combo_hw)
-    # Build the (hw, topo) cross-product to look up. With per-hw overrides
+    # Build the (hw, topo) pairs to look up. With per-hw overrides
     # the same hw might still pick different topos across combos (it
     # shouldn't in practice, since each kind has one cluster), but we
     # handle that by collecting topos across all (hw, combo) pairs.
-    pairs: set[tuple[str, str]] = set()
-    for hw in hw_types:
-        for combo in machine_combinations:
-            # only meaningful (hw, combo) pairs — combo's hw matters
-            # because we look up profile under that hw. Iterate hw_types
-            # to be safe; the resolver picks the topo.
-            pairs.add((hw, _resolve_topo_for(hw, combo, topo_tag_override)))
+    pairs = _requested_pairs(combo_hw, machine_combinations, topo_tag_override, core_ids)
+    if core_ids:
+        # Sorted, so which profile fills the p/e buckets last (and so names a
+        # dispatch's module) does not depend on PYTHONHASHSEED. The K1 path
+        # keeps its original iteration.
+        pairs = sorted(pairs)
 
     for hw, topo in pairs:
+        hw_dir, target = split_hw_label(hw, profile_target)
         for model_candidate in candidates:
             csv_path = find_profile_csv(
                 repo_base_path, model=model_candidate,
-                target=profile_target, hw=hw, basename=basename, topo_tag=topo,
+                target=target, hw=hw_dir, basename=basename, topo_tag=topo,
                 gen_root=gen_root,
             )
             if csv_path:
@@ -729,6 +778,7 @@ def load_profiled_processing_times(
     strict: bool = True,
     gen_root: str = "gen",
     board_calibration: dict | None = None,
+    core_ids: dict[str, list[int]] | None = None,
 ) -> tuple[dict[str, list[float]], dict[int, dict], dict[int, dict], dict[str, dict[str, dict[int, dict]]]]:
     """
     Load profiled processing times for all networks and dispatches.
@@ -795,13 +845,11 @@ def load_profiled_processing_times(
             net_id, net_info, dispatch_deps_path,
             repo_base_path, profile_target, combo_hw, machine_combinations,
             topo_tag_override=topo_tag_override, gen_root=gen_root,
+            core_ids=core_ids,
         )
         # Verify every (hw, topo) requested by the schedule has a profile.
-        hw_types = set(combo_hw)
-        requested_pairs: set[tuple[str, str]] = set()
-        for hw in hw_types:
-            for combo in machine_combinations:
-                requested_pairs.add((hw, _resolve_topo_for(hw, combo, topo_tag_override)))
+        requested_pairs = _requested_pairs(
+            combo_hw, machine_combinations, topo_tag_override, core_ids)
         for (hw, topo) in requested_pairs:
             if (hw, topo) not in all_profiles:
                 # IME is an OPTIONAL per-network capability: a network with no
@@ -821,9 +869,10 @@ def load_profiled_processing_times(
                 if any(h == hw for (h, _t) in all_profiles):
                     continue
                 if strict:
+                    hw_dir, target = split_hw_label(hw, profile_target)
                     missing.append(
                         f"  - {net_id} @ {hw}/{topo}: no profile CSV under "
-                        f"{gen_root}/profile/{hw}/{profile_target}/<model>/<basename>/.../{topo}/results.csv"
+                        f"{gen_root}/profile/{hw_dir}/{target}/<model>/<basename>/.../{topo}/results.csv"
                     )
         if not all_profiles:
             if not strict:
@@ -856,7 +905,7 @@ def load_profiled_processing_times(
             combo_times: list[float | None] = []
             for ci, combo in enumerate(machine_combinations):
                 hw = combo_hw[ci]
-                topo = _resolve_topo_for(hw, combo, topo_tag_override)
+                topo = _resolve_topo_for(hw, combo, topo_tag_override, core_ids)
                 prof = all_profiles.get((hw, topo))
 
                 t_ms = None
