@@ -1,0 +1,79 @@
+{
+  "_comment": "K3, X100 cores only (TASK-008, 2026-11-02): the K1 workload networks_k1_deployed_rich_vithead.json (deployed drone stack plus a ViNT-class transformer vision head) WITHOUT fused_full, whose model code (the collaborator's vitfly fused_model.py) is not available here. Same periods, windows and instance counts as the K1 file: mlp_control 100 Hz, yolov8_nano_64x96 45 Hz (22 ms), ffn_block and attn_block 10 Hz. X100 matrix layers on ime_x100. Singletons (the K1 file uses shard; the K3 has single-core profiles only).",
+  "hardware": {
+    "machines": {
+      "cpu_p": 8
+    },
+    "profile": {
+      "target": "spacemit_x100",
+      "gen_root": "../gen/k3",
+      "targets": {
+        "cpu_p": "spacemit_x100"
+      },
+      "impls": {
+        "cpu_p": {
+          "rvv": "rvv_x60",
+          "ime": "ime_x100"
+        }
+      },
+      "core_ids": {
+        "cpu_p": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ]
+      }
+    },
+    "p_core_speedup": 1.0
+  },
+  "scheduler": {
+    "random_seed": 42,
+    "solver_verbosity": 1,
+    "time_limit": 120,
+    "use_profiled": true,
+    "prune_periodic": true,
+    "restrict_makespan_to_nonperiodic": false,
+    "machine_combination_mode": "singletons",
+    "enable_impls": true
+  },
+  "networks": {
+    "mlp_control": {
+      "id": 0,
+      "identifier": "mlp_control",
+      "dispatch_deps_path": "gen_mb/vmfb/mlp_control/spacemit_x60/rvv_x60/mlp_control.int8/mlp_control.int8_dispatch_graph.json",
+      "period": 10.0,
+      "window_duration": 10.0,
+      "num_instances": 12
+    },
+    "yolov8_nano_64x96": {
+      "id": 1,
+      "identifier": "yolov8_nano_64x96",
+      "dispatch_deps_path": "gen_mb/vmfb/yolov8_nano_64x96/spacemit_x60/rvv_x60/yolov8_nano_64x96.int8/yolov8_nano_64x96.int8_dispatch_graph.json",
+      "period": 22.0,
+      "window_duration": 22.0,
+      "num_instances": 5
+    },
+    "ffn_block": {
+      "id": 2,
+      "identifier": "ffn_block",
+      "dispatch_deps_path": "gen_mb/vmfb/ffn_block/spacemit_x60/rvv_x60/ffn_block.int8/ffn_block.int8_dispatch_graph.json",
+      "period": 100.0,
+      "window_duration": 100.0,
+      "num_instances": 1
+    },
+    "attn_block": {
+      "id": 3,
+      "identifier": "attn_block",
+      "dispatch_deps_path": "gen_mb/vmfb/attn_block/spacemit_x60/rvv_x60/attn_block.int8/attn_block.int8_dispatch_graph.json",
+      "period": 100.0,
+      "window_duration": 100.0,
+      "num_instances": 1
+    }
+  },
+  "edges": []
+}

@@ -1,0 +1,50 @@
+{
+  "_comment": "K3, X100 cores only (TASK-008 P1, 2026-10-28): the K1 ffn_ime workload (mlp_control at 100 Hz beside ffn_block at 10 Hz) on the K3's 8 X100 cores. Same networks, periods and dispatch graphs as networks_k1_ffn_ime.json; profiles come from the K3 tree (k3-work/gen/k3), measured on X100 cpu 0. enable_impls: each dispatch has an rvv_x60 and an ime_x60 cost cell. Unlike the K1, smt.vmadot works on all 8 X100 cores, so one 8-core CPU_P pool carries both.",
+  "_machines_comment": "One CPU_P pool of 8 (cpu_e 0 is dropped by load_networks_config). Ingest with --registry cores/spacemit_k3.json --cpu-p-kind x100 maps CPU_P#n to hart n (0-7).",
+  "hardware": {
+    "machines": {
+      "cpu_p": 8,
+      "cpu_e": 0
+    },
+    "profile_hw": {
+      "cpu_p": "rvv_x60",
+      "cpu_e": "rvv_x60"
+    },
+    "profile": {
+      "target": "spacemit_x100",
+      "topo_tag": "topo_0",
+      "topo_tag_override": true,
+      "gen_root": "../gen/k3"
+    },
+    "p_core_speedup": 1.0
+  },
+  "scheduler": {
+    "random_seed": 42,
+    "solver_verbosity": 1,
+    "time_limit": 120,
+    "use_profiled": true,
+    "prune_periodic": true,
+    "restrict_makespan_to_nonperiodic": false,
+    "machine_combination_mode": "singletons",
+    "enable_impls": true
+  },
+  "networks": {
+    "mlp_control": {
+      "id": 0,
+      "identifier": "mlp_control",
+      "dispatch_deps_path": "gen_mb/vmfb/mlp_control/spacemit_x60/rvv_x60/mlp_control.int8/mlp_control.int8_dispatch_graph.json",
+      "period": 10,
+      "window_duration": 10,
+      "num_instances": 16
+    },
+    "ffn_block": {
+      "id": 1,
+      "identifier": "ffn_block",
+      "dispatch_deps_path": "gen_mb/vmfb/ffn_block/spacemit_x60/rvv_x60/ffn_block.int8/ffn_block.int8_dispatch_graph.json",
+      "period": 100.0,
+      "window_duration": 100.0,
+      "num_instances": 2
+    }
+  },
+  "edges": []
+}

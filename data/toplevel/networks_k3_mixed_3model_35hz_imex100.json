@@ -1,0 +1,87 @@
+{
+  "_comment": "K3 (TASK-008, 2026-10-29): the K1 three-model benchmark (mlp_control 100 Hz, dronet 30 Hz) with yolov8_nano (160x160) at 35 Hz on all 16 K3 cores (X100 0-7, A100 8-15); X100 matrix impl = ime_x100, the K3-only X100 backend (Director 2026-10-29), profiled forced like ime_x60.",
+  "hardware": {
+    "machines": {
+      "cpu_p": 8,
+      "cpu_e": 8
+    },
+    "profile": {
+      "target": "spacemit_x100",
+      "gen_root": "../gen/k3",
+      "targets": {
+        "cpu_p": "spacemit_x100",
+        "cpu_e": "spacemit_a100"
+      },
+      "impls": {
+        "cpu_p": {
+          "rvv": "rvv_x60",
+          "ime": "ime_x100"
+        },
+        "cpu_e": {
+          "rvv": "rvv_x60",
+          "ime2": "ime2_a100"
+        }
+      },
+      "core_ids": {
+        "cpu_p": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "cpu_e": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      }
+    },
+    "p_core_speedup": 1.0
+  },
+  "scheduler": {
+    "random_seed": 42,
+    "solver_verbosity": 1,
+    "time_limit": 120,
+    "use_profiled": true,
+    "prune_periodic": true,
+    "restrict_makespan_to_nonperiodic": false,
+    "machine_combination_mode": "singletons",
+    "enable_impls": true
+  },
+  "networks": {
+    "mlp_control": {
+      "id": 0,
+      "identifier": "mlp_control",
+      "dispatch_deps_path": "gen_mb/vmfb/mlp_control/spacemit_x60/rvv_x60/mlp_control.int8/mlp_control.int8_dispatch_graph.json",
+      "period": 10,
+      "window_duration": 10,
+      "num_instances": 32
+    },
+    "dronet": {
+      "id": 1,
+      "identifier": "dronet",
+      "dispatch_deps_path": "gen_mb/vmfb/dronet/spacemit_x60/rvv_x60/dronet.int8/dronet.int8_dispatch_graph.json",
+      "period": 33.3,
+      "window_duration": 33.3,
+      "num_instances": 10
+    },
+    "yolov8_nano": {
+      "id": 2,
+      "identifier": "yolov8_nano",
+      "dispatch_deps_path": "gen_mb/vmfb/yolov8_nano/spacemit_x60/rvv_x60/yolov8_nano.int8/yolov8_nano.int8_dispatch_graph.json",
+      "period": 28.571,
+      "window_duration": 28.571,
+      "num_instances": 35
+    }
+  },
+  "edges": []
+}
