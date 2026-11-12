@@ -376,8 +376,9 @@ def schedule_iree_networks(
     # rejected here rather than discovered on the board, and until now it was
     # not: capabilities.py was unit-tested and called by nothing.
     try:
-        from capabilities import check_profile_hw_map
-        check_profile_hw_map(cfg["profile_hw_map"])
+        from capabilities import check_profile_hw_map, capabilities_for_target
+        check_profile_hw_map(cfg["profile_hw_map"],
+                             capabilities=capabilities_for_target(profile_target))
     except ImportError:
         pass  # capabilities.py is K1-specific; other targets need not have it
 
@@ -394,19 +395,20 @@ def schedule_iree_networks(
     combo_impls = None
     enable_impls = bool(networks_data.get("scheduler", {}).get("enable_impls", False))
     if enable_impls:
-        from capabilities import build_machine_combinations_with_impls, K1_CAPABILITIES
+        from capabilities import build_machine_combinations_with_impls, capabilities_for_target
+        _caps = capabilities_for_target(profile_target)   # K1 unless the target says otherwise
         # Expose only rvv+ime as placement choices (scalar is a correctness
         # fallback, never a preferred placement); intersect with each kind's caps.
         machine_impls = {
-            k: [i for i in ("rvv", "ime") if i in K1_CAPABILITIES.get(k, frozenset())]
+            k: [i for i in ("rvv", "ime") if i in _caps.get(k, frozenset())]
             for k in machine_core_counts
         }
         _gran = "per_core" if machine_combination_mode == "singletons" else machine_combination_mode
         machines, machine_combinations, combo_impls = build_machine_combinations_with_impls(
-            machine_core_counts, machine_impls, K1_CAPABILITIES, granularity=_gran)
+            machine_core_counts, machine_impls, _caps, granularity=_gran)
         n_ime = sum(1 for x in combo_impls if x == "ime")
         print(f"  Impl-aware combinations: {len(machine_combinations)} total, "
-              f"{n_ime} ime (cluster-0 only), rest rvv")
+              f"{n_ime} ime, rest rvv")
     else:
         machines, machine_combinations = build_machine_combinations(
             machine_core_counts, mode=machine_combination_mode)
