@@ -160,14 +160,14 @@ class ItRefusesRatherThanEmittingAHintTheRewriterRejects(unittest.TestCase):
         anchor_op, anchor_item = _anchor()
         code, hint, err = _run(
             [_advice_item(0, 9000, 4000,
-                          "m$dispatch_0_rvv_x60_maxpool2d_s8_N1xC128xIH5xIW5"),
+                          "m$dispatch_0_rvv_x60_softmax_s8_N1xC128xIH5xIW5"),
              anchor_item],
-            [{"name": "p", "op": "maxpool2d_s8", "dispatch_id": 0,
+            [{"name": "p", "op": "softmax_s8", "dispatch_id": 0,
               "inputs": ["x"], "outputs": ["y"],
               "shape": {"N": 1, "C": 128, "IH": 5, "IW": 5}, "depends_on": []},
              anchor_op])
         self.assertEqual(code, 1)
-        self.assertIn("not\nsplit-capable".replace("\n", " "), err)
+        self.assertIn("not split-capable", err)
         self.assertIsNone(hint)
 
     def test_an_unknown_dispatch_id_is_refused(self):
@@ -238,22 +238,120 @@ class GraphIdentityIsEstablishedBeforeAnythingIsDerived(unittest.TestCase):
         self.assertNotIn("C_inputs[128, 64]", want)
 
 
+class NewAxes(unittest.TestCase):
+    """E (pointwise n), C (maxpool channels), OH (conv rows), tile multiple."""
+
+    def _one(self, op, name, svc=9000, slot=4000, extra=()):
+        anchor_op, anchor_item = _anchor()
+        return _run([_advice_item(0, svc, slot, name), anchor_item],
+                    [op, anchor_op], extra_argv=extra)
+
+    def test_maxpool_splits_on_C_default_axis_not_emitted(self):
+        code, hint, _ = self._one(
+            {"name": "p", "op": "maxpool2d_s8", "dispatch_id": 0,
+             "inputs": ["x"], "outputs": ["y"], "depends_on": [],
+             "shape": {"N": 1, "C": 32, "IH": 10, "IW": 10}},
+            "m$dispatch_0_rvv_x60_maxpool2d_s8_N1xC32xIH10xIW10")
+        self.assertEqual(code, 0)
+        self.assertEqual(hint["networks"][0]["split_ops"],
+                         [{"op": 0, "n_splits": 4}])
+        self.assertEqual(hint["_provenance"]["derivation"][0]["axis"], "C")
+
+    def test_pointwise_uses_element_count(self):
+        code, hint, _ = self._one(
+            {"name": "s", "op": "silu_s8", "dispatch_id": 0, "inputs": ["x"],
+             "outputs": ["y"], "depends_on": [], "shape": {"n": 25600}},
+            "m$dispatch_0_rvv_x60_silu_s8_n25600")
+        self.assertEqual(code, 0)
+        d = hint["_provenance"]["derivation"][0]
+        self.assertEqual((d["axis"], d["E"]), ("E", 25600))
+        self.assertEqual(25600 % d["n_splits"], 0)
+
+    def test_conv_falls_back_to_OH_when_oc_has_no_divisor(self):
+        # OC=7 has no divisor in [2,4]; OH=20 does.
+        code, hint, _ = self._one(
+            _conv_op(0, oc=7, kind="conv2d_s8"),
+            "m$dispatch_0_rvv_x60_conv2d_s8_N1xIC64xIH20xIW20xOC7xOH20xOW20x"
+            "KH3xKW3xSH1xSW1xPH1xPW1")
+        self.assertEqual(code, 0)
+        e = hint["networks"][0]["split_ops"][0]
+        self.assertEqual(e["axis"], "OH")
+        self.assertEqual(20 % e["n_splits"], 0)
+
+    def test_fused_conv_never_gets_OH(self):
+        code, hint, err = self._one(
+            _conv_op(0, oc=7), "m$dispatch_0_rvv_x60_"
+            "conv2d_batchnorm2d_silu_s8_noshape")
+        self.assertEqual(code, 1)
+        self.assertIsNone(hint)
+
+    def test_tile_multiple_keeps_oc_tiles_aligned(self):
+        # OC=48, need 3: legal d with (48/d)%16==0 -> {3}. OC=32 need 4 -> 2.
+        self.assertEqual(bridge.choose_n_splits(48, 3, 4, 16), (3, True))
+        self.assertEqual(bridge.choose_n_splits(32, 4, 4, 16), (2, False))
+        self.assertEqual(bridge.choose_n_splits(16, 2, 4, 16), (None, False))
+        self.assertEqual(bridge.choose_n_splits(64, 3, 4, 1), (4, True))
+        code, hint, _ = self._one(
+            _conv_op(0, oc=64), "m$dispatch_0_rvv_x60_"
+            "conv2d_batchnorm2d_silu_s8_noshape", svc=9000, slot=4000,
+            extra=("--tile-multiple", "16"))
+        self.assertEqual(code, 0)
+        n = hint["networks"][0]["split_ops"][0]["n_splits"]
+        self.assertEqual((64 // n) % 16, 0)
+
+    def test_axis_extent(self):
+        self.assertEqual(bridge.axis_extent({"n": 9}, "E"), 9)
+        self.assertEqual(bridge.axis_extent({"IH": 80, "KH": 3, "SH": 2,
+                                             "PH": 1}, "OH"), 40)
+
+
+def _rewriter_source():
+    """The merge-branch applier (E/C/OH). The XPU-RT/ModelBlaster submodule is
+    an empty placeholder, so look in the sibling checkout, falling back to the
+    merge branch's blob if the k3-split port has not landed there yet."""
+    import subprocess
+    mb = os.path.join(os.path.dirname(_REPO), "ModelBlaster")
+    for cand in (os.path.join(_REPO, "ModelBlaster", "pipeline",
+                              "apply_split_hint.py"),
+                 os.path.join(mb, "pipeline", "apply_split_hint.py")):
+        if os.path.exists(cand) and "_SPLITTABLE_BY_AXIS" in open(cand).read():
+            return cand
+    try:
+        src = subprocess.run(
+            ["git", "-C", mb, "show",
+             "origin/merge-origin-main-20260831:pipeline/apply_split_hint.py"],
+            capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return None
+    f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    f.write(src)
+    f.close()
+    return f.name
+
+
 class TheBridgeAndTheRewriterAgreeOnWhatIsSplittable(unittest.TestCase):
     """`SPLITTABLE_AXIS` is mirrored, not imported, so the script runs without
     ModelBlaster on the path. This is what makes the mirror safe: drift fails a
     test instead of producing hints the rewriter refuses."""
 
-    def test_supported_kinds_match_apply_split_hint(self):
-        rewriter_path = os.path.join(_REPO, "ModelBlaster", "pipeline",
-                                     "apply_split_hint.py")
-        if not os.path.exists(rewriter_path):
-            self.skipTest("ModelBlaster not present in this tree")
-        rewriter = _load(rewriter_path, "_apply_split_hint")
-        self.assertEqual(set(bridge.SPLITTABLE_AXIS),
-                         set(rewriter._SPLITTABLE),
-                         "advice_to_split_hint.SPLITTABLE_AXIS has drifted "
-                         "from apply_split_hint._SPLITTABLE; a hint for a kind "
-                         "only one of them knows is a hint that gets refused")
+    def test_supported_kinds_and_axes_match_apply_split_hint(self):
+        path = _rewriter_source()
+        if path is None:
+            self.skipTest("no E/C/OH-capable apply_split_hint.py available "
+                          "(ModelBlaster submodule empty, merge branch absent)")
+        rw = _load(path, "_apply_split_hint")
+        by_axis = rw._SPLITTABLE_BY_AXIS
+        # The bridge deliberately omits fp16/fp32 and non-int8 kinds and
+        # linear M (handled separately); everything it lists must be accepted.
+        for kind, axes in bridge.SPLITTABLE_AXES.items():
+            self.assertEqual(rw._DEFAULT_AXIS[kind], axes[0], kind)
+            for ax in axes:
+                self.assertIn(kind, by_axis[ax], (kind, ax))
+        self.assertEqual(set(bridge.POINTWISE_KINDS),
+                         set(rw._POINTWISE_KINDS))
+        self.assertEqual(set(bridge.POOL_C_KINDS), set(rw._POOL_C_KINDS))
+        self.assertEqual(set(k for k, v in by_axis["OH"].items()),
+                         {"conv2d_s8"})
 
 
 if __name__ == "__main__":
